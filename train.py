@@ -1,3 +1,4 @@
+# train.py
 # -*coding=utf-8*-
 
 import torch
@@ -18,14 +19,19 @@ from pycocoevalcap.cider.cider import Cider
 from nltk.translate.bleu_score import SmoothingFunction
 import re
 import torch.nn.init as init
+
+# 【此处可修改】
+# from torch.cuda.amp import autocast
+# from torch.amp import GradScaler
 from torch.cuda.amp import autocast, GradScaler
+
 from torch.nn.utils import clip_grad_norm_
 
 
 # 加载词表(vocab)
 def load_vocab(vocab_path, captions_file, freq_threshold):
     if os.path.exists(vocab_path):
-        vocab = torch.load(vocab_path)
+        vocab = torch.load(vocab_path, weights_only=False)  # PyTorch 2.6 的安全机制 需要weights_only=False
     else:
         # Create a temporary dataset to build vocab
         temp_dataset = Flickr30kDataset(root_dir='', captions_file=captions_file, freq_threshold=freq_threshold)
@@ -42,9 +48,17 @@ def validate(model, val_loader, criterion, device, vocab, tqdm_bar):
     hypotheses = []
 
     with torch.no_grad():
-        for imgs, captions in tqdm(val_loader, desc="Validating"):
-            imgs, captions = imgs.to(device), captions[:, :-1].to(device)
-            outputs = model(imgs, captions[:, :-1])  # 移除 <EOS> token
+
+        # 【修改2026/03/25】
+
+        # for imgs, captions in tqdm(val_loader, desc="Validating"):
+        #     imgs, captions = imgs.to(device), captions[:, :-1].to(device)
+        #     outputs = model(imgs, captions[:, :-1])  # 移除 <EOS> token
+
+        for imgs, input_caps, target_caps, lengths in tqdm(val_loader, desc="Validating"):
+            imgs = imgs.to(device)
+            input_caps = input_caps.to(device)
+            target_caps = target_caps.to(device)
 
             # print(outputs.shape)  # 应该显示 [batch_size, seq_length, vocab_size]
             # print(captions[:, 1:].shape)  # 应该显示 [batch_size, seq_length]
@@ -58,21 +72,26 @@ def validate(model, val_loader, criterion, device, vocab, tqdm_bar):
             #     outputs = outputs[:, :captions[:, 1:].shape[1],·
             #               :]  # Adjust sequence length of outputs to match captions
 
-            outputs = outputs[:, :captions.size(1), :]  # 调整 outputs 的序列长度
+            # 【修改2026/03/25】
+            # outputs = outputs[:, :captions.size(1), :]  # 调整 outputs 的序列长度
+            # loss = criterion(outputs.reshape(-1, outputs.shape[2]), captions[:, 1:].reshape(-1))
+            outputs = model(imgs, input_caps)
+            loss = criterion(outputs.reshape(-1, outputs.shape[2]),  # (batch*seq_len, vocab_size)
+                             target_caps.reshape(-1)  # (batch*seq_len,)
+                             )
 
             # print(outputs.shape)  # 应该显示 [batch_size, seq_length, vocab_size]
             # print(captions[:, 1:].shape)  # 应该显示 [batch_size, seq_length]
             # breakpoint()
 
-            loss = criterion(outputs.reshape(-1, outputs.shape[2]), captions[:, 1:].reshape(-1))
             total_loss += loss.item()
 
             tqdm_bar.set_postfix(loss=loss.item())
 
             # 生成预测结果
             predicted_ids = outputs.argmax(-1)
-            for i in range(len(captions)):
-                real_caption = [vocab.itos[idx.item()] for idx in captions[i] if
+            for i in range(len(target_caps)):
+                real_caption = [vocab.itos[idx.item()] for idx in target_caps[i] if
                                 idx not in [vocab.stoi['<PAD>'], vocab.stoi['<SOS>'], vocab.stoi['<EOS>']]]
                 pred_caption = [vocab.itos[idx.item()] for idx in predicted_ids[i] if
                                 idx not in [vocab.stoi['<PAD>'], vocab.stoi['<SOS>'], vocab.stoi['<EOS>']]]
@@ -120,13 +139,51 @@ def validate(model, val_loader, criterion, device, vocab, tqdm_bar):
 
 
 def my_collate(batch):
+    """
+        自定义collate函数，处理变长caption序列
+
+        Args:
+            batch: list of (image, caption_tensor)
+        Returns:
+            images: (batch_size, 3, 299, 299)
+            input_captions: (batch_size, max_seq_len) 输入decoder，包含<SOS>到倒数第二个词
+            target_captions: (batch_size, max_seq_len) 计算loss，从第二个词到<EOS>
+            lengths: 实际长度（用于mask）
+    """
+    # 【修改2026/03/25】
+    # 按caption长度排序（有助于pack_padded_sequence，虽然Transformer不需要，但效率更好）
+    batch.sort(key=lambda x: len(x[1]), reverse=True)
+
     images, captions = zip(*batch)
-    images = torch.stack(images, dim=0)
 
-    # Pad the captions to the length of the longest caption
-    captions = pad_sequence(captions, batch_first=True, padding_value=0)  # 0是<PAD>的索引
+    # 堆叠图像
+    images = torch.stack(images, dim=0)  # (batch, 3, 299, 299)
 
-    return images, captions
+    # 【修改2026/03/25】
+    # 获取长度
+    lengths = [len(cap) for cap in captions]
+    max_len = max(lengths)
+
+    # 【修改2026/03/25】
+    # # Pad the captions to the length of the longest caption
+    # captions = pad_sequence(captions, batch_first=True, padding_value=0)  # 0是<PAD>的索引
+    # return images, captions
+
+    # 【修改2026/03/25】
+    # Padding captions
+    # PAD的索引是0
+    padded_captions = torch.zeros(len(captions), max_len, dtype=torch.long)
+    for i, cap in enumerate(captions):
+        end = lengths[i]
+        padded_captions[i, :end] = cap[:end]
+
+    # 切分输入和目标
+    # input: 从<SOS>开始，去掉最后一个token（<EOS>或实际最后一个词）
+    # target: 从第二个词开始，到<EOS>结束
+    input_captions = padded_captions[:, :-1]  # (batch, max_len-1)
+    target_captions = padded_captions[:, 1:]  # (batch, max_len-1)
+
+    return images, input_captions, target_captions, lengths
 
 
 # 初始化模型权重
@@ -185,20 +242,37 @@ def train(log_file, model, train_loader, val_loader, criterion, optimizer, num_e
             total_loss = 0
             model.train()
             tqdm_bar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
-            for step, (imgs, captions) in enumerate(tqdm_bar):
-                imgs, captions = imgs.to(device), captions.to(device)
+
+            # 【修改2026/03/25】
+
+            # for step, (imgs, captions) in enumerate(tqdm_bar):
+            #    imgs, captions = imgs.to(device), captions.to(device)
+            for step, (imgs, input_caps, target_caps, lengths) in enumerate(tqdm_bar):
+                imgs = imgs.to(device)
+                input_caps = input_caps.to(device)  # (batch, seq_len) 包含<SOS>
+                target_caps = target_caps.to(device)  # (batch, seq_len) 包含<EOS>
 
                 optimizer.zero_grad()
 
                 # 【优化项】使用混合精度训练
                 # 将autocast上下文管理器应用于模型的前向传播，以自动将计算转换为半精度
                 with autocast():
-                    outputs = model(imgs, captions[:, :-1])  # 移除 <EOS> token
-                    loss = criterion(outputs.reshape(-1, outputs.shape[2]), captions[:, 1:].contiguous().view(-1))
+                    # 【修改2026/03/25】
+                    # outputs = model(imgs, captions[:, :-1])  # 移除 <EOS> token
+                    # loss = criterion(outputs.reshape(-1, outputs.shape[2]), captions[:, 1:].contiguous().view(-1))
+                    outputs = model(imgs, input_caps)  # (batch, seq_len, vocab_size)
+                    # 计算loss
+                    # outputs和target_caps现在长度一致，都是seq_len
+                    loss = criterion(
+                        outputs.reshape(-1, outputs.shape[2]),  # (batch*seq_len, vocab_size)
+                        target_caps.reshape(-1)  # (batch*seq_len,)
+                    )
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print("NaN or Inf loss detected")
-                    print("Captions:", captions)
+                    # print("Captions:", captions)
+                    print("input_caps:", input_caps)
+                    print("target_caps:", target_caps)
                     print("Outputs:", outputs)
                     # 可以选择停止训练
                     break
@@ -272,6 +346,7 @@ def train(log_file, model, train_loader, val_loader, criterion, optimizer, num_e
     # 不论如何都保存最终模型
     current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     # model_save_path = f'./models/model_epoch_{last_epoch}_{current_time}.pth'
+
     if pretrain:
         last_epoch = last_epoch + num_old_epoch
 
@@ -297,39 +372,41 @@ if __name__ == "__main__":
     parser.add_argument('--val_captions_file', type=str, default='data/val/val.token',
                         help='Path to the captions file for training')
 
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='batch size')
-    parser.add_argument('--num_epochs', type=int, default=80,
+    parser.add_argument('--num_epochs', type=int, default=12,
                         help='amount of epochs')
     parser.add_argument('--embed_size', type=int, default=256,
                         help='size of embedding')
     parser.add_argument('--hidden_size', type=int, default=512,
                         help='size of hidden')
-    parser.add_argument('--vocab_size', type=int, default=8943,
+    parser.add_argument('--vocab_size', type=int, default=7329,
                         help='size of vocabulary')
-    parser.add_argument('--num_layers', type=int, default=1,
+    parser.add_argument('--num_layers', type=int, default=2,
                         help='amount of layers')
     parser.add_argument('--freq_threshold', type=int, default=1,
                         help='threshold frequent')
     parser.add_argument('--early_stop_count', type=int, default=0,
                         help='early stop count')
-    parser.add_argument('--early_stop_limit', type=int, default=80,
+    parser.add_argument('--early_stop_limit', type=int, default=5,
                         help='early stop limit')
 
     parser.add_argument('--clip_norm', type=float, default=1.0,
                         help='threshold of grad clip')
     parser.add_argument('--smooth_epsilon', type=float, default=0.05,
                         help='label smooth epsilon')
-    parser.add_argument('--lr', type=float, default=0.0005,
+    parser.add_argument('--lr', type=float, default=0.001,
                         help='learning rate')
     parser.add_argument('--dropout', type=float, default=0.3,
                         help='dropout rate of the model')
+    parser.add_argument('--max_seq_len', type=int, default=100,
+                        help='The maximum length of a sequence')
 
     parser.add_argument('--pretrain', action='store_true',
                         help='load trained models')
     parser.add_argument('--unfrozen', action='store_true',
                         help='Unfrozen the model')
-    parser.add_argument('--preModel', type=str, default='models/model_epoch_5_2024-11-28_02-08-37.pth',
+    parser.add_argument('--preModel', type=str, default='models/0327_Instance01/0327_train_81-90ep/model_epoch_90_2026-03-27_13-39-00.pth',
                         help='path to trained models')
     parser.add_argument('--vocab_path', type=str, default='vocab.pth',
                         help='path to local vocab')
@@ -339,10 +416,13 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     learning_rate = args.lr
     dropout = args.dropout
+    max_seq_len = args.max_seq_len
     num_epochs = args.num_epochs
     embed_size = args.embed_size
     hidden_size = args.hidden_size
+
     vocab_size = args.vocab_size  # 根据实际情况调整
+
     num_layers = args.num_layers
     freq_threshold = args.freq_threshold
     clip_norm = args.clip_norm
@@ -354,6 +434,10 @@ if __name__ == "__main__":
     val_captions_file = args.val_captions_file
 
     pretrain = args.pretrain
+    # HARDCODE pretrain=false
+    # 回头记得改回去
+    pretrain = True
+
     preModel = args.preModel
     unfrozen = args.unfrozen
     vocab_path = args.vocab_path
@@ -398,6 +482,17 @@ if __name__ == "__main__":
     rouge_l_scores = []
     cider_scores = []
 
+    print(f"\n\t训练参数列表:\n"
+          f"\tnum_layers = {num_layers}\n"
+          f"\tembed_size = {embed_size}\n"
+          f"\thidden_size = {hidden_size}\n"
+          f"\tdropout = {dropout}\n"
+          f"\tlearning_rate = {learning_rate}\n"
+          f"\tbatch_size = {batch_size}\n"
+          f"\tnum_epochs = {num_epochs}\n"
+          f"\tsmooth_epsilon = {smooth_epsilon}\n"
+          f"\tpretrain = {pretrain}\n")
+
     print("\t传参完成\n")
 
     # ##############################################################################
@@ -407,12 +502,13 @@ if __name__ == "__main__":
 
     # 加载或创建词表
     vocab = load_vocab(vocab_path, args.train_captions_file, freq_threshold)
+    vocab_size = len(vocab)
 
     # 加载训练数据集
     train_dataset = Flickr30kDataset(
         root_dir=train_root_dir,
         captions_file=train_captions_file,
-        transform=transform_train,
+        transform=transform_val,
         freq_threshold=freq_threshold,
         vocab=vocab
     )
@@ -421,7 +517,7 @@ if __name__ == "__main__":
     val_dataset = Flickr30kDataset(
         root_dir=val_root_dir,  # 确保这里的路径正确
         captions_file=val_captions_file,
-        transform=transform_train,
+        transform=transform_val,
         freq_threshold=freq_threshold,
         vocab=vocab
     )
@@ -442,7 +538,12 @@ if __name__ == "__main__":
     print("开始执行：Phase_2<模型初始化>")
 
     # 初始化模型
-    model = ImageCaptioningModel(embed_size, hidden_size, vocab_size, num_layers, dropout=dropout).to(device)
+    # model = ImageCaptioningModel(embed_size, hidden_size, vocab_size, num_layers, dropout=dropout).to(device)
+
+    # 修改后（如果DecoderTransformer需要max_seq_len参数）
+    model = ImageCaptioningModel(embed_size, hidden_size, vocab_size, num_layers, dropout=dropout,
+                                 max_seq_len=max_seq_len).to(
+        device)
 
     # 【优化项】修改模型权重的初始化策略
     model.apply(weights_init)
@@ -462,19 +563,24 @@ if __name__ == "__main__":
 
     # 【优化项】在 train.py 中添加学习率调度器
     # https://zhuanlan.zhihu.com/p/538447997
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=0.000001)  # 余弦退火
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=0.0001)  # 余弦退火
     # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)  # 指数下降
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
 
     # 【优化项】采用混合精度计算
     # 初始化GradScaler，用于调整梯度的缩放，以防止在半精度下进行反向传播时出现梯度下溢
+
+
+    # 【此处可修改】
+    # scaler = Gradscaler('cuda')
     scaler = GradScaler()
 
     # 如需要，加载预训练模型
-    pretrain = True
     # unfrozen = True
     # print(pretrain)
     # breakpoint()
+
+
 
     if pretrain:
         model_filepath = preModel
@@ -485,7 +591,9 @@ if __name__ == "__main__":
         else:
             num_old_epoch = 0  # 如果没有找到，设置为0或其他默认值
         if os.path.exists(model_filepath):
-            model.load_state_dict(torch.load(model_filepath, map_location=device), strict=False)
+            model.load_state_dict(torch.load(model_filepath, map_location=device,
+                                             weights_only=False),  # PyTorch 2.6 的安全机制 需要weights_only=False
+                                  strict=False)
             print(f"\t已从{model_filepath}加载预训练模型权重。\n\t已应用保存的模型权重到当前模型。")
             # 重置dropout
             for name, module in model.named_modules():
@@ -498,7 +606,7 @@ if __name__ == "__main__":
     # 模型解冻
     if unfrozen:
         print("\t已确认需解冻模型编码器特征提取器")
-        for param in model.encoder.feature_extractor.parameters():
+        for param in model.encoder.features.parameters():
             param.requires_grad = True
         print("\t解冻完成")
 
@@ -643,46 +751,163 @@ if __name__ == "__main__":
     # ##############################################################################
     # Phase_4 - 训练结果可视化
     ################################################################################
+
     print("开始执行：Phase_4<训练结果可视化>")
 
-    # 绘制损失图
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    plt.figure(figsize=(10, 5))
-    # epochs = range(1, num_epochs + 1)
-    # steps_per_epoch = len(train_loader)
-    # step_numbers = [i for epoch in epochs for i in range(steps_per_epoch)]  # 生成每个epoch的step编号
+    import os
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
 
-    # plt.plot(step_numbers, step_train_losses, label='Training Loss', marker='o')  # 使用每个step的训练loss
-    # plt.plot(val_losses, label='Validation Loss', marker='o')  # 使用每个epoch的验证loss
-    # plt.xlabel('Epochs/Steps')
+    # 设置中文字体支持
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 自动创建结果目录
+    os.makedirs('Result_Fig', exist_ok=True)
+
+    # 获取时间戳
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # ==================== 损失曲线图 ====================
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=100)
+
+    epochs = range(1, len(train_losses) + 1)
+
+    # 绘制曲线
+    ax.plot(epochs, train_losses, 'b-', linewidth=2.5, label='Training Loss',
+            marker='o', markersize=5, markerfacecolor='white', markeredgewidth=2)
+    ax.plot(epochs, val_losses, 'r-', linewidth=2.5, label='Validation Loss',
+            marker='s', markersize=5, markerfacecolor='white', markeredgewidth=2)
+
+    # 标注最佳验证点
+    best_val_epoch = val_losses.index(min(val_losses)) + 1
+    best_val_loss = min(val_losses)
+    ax.axvline(x=best_val_epoch, color='green', linestyle='--', alpha=0.6, linewidth=1.5)
+    ax.scatter([best_val_epoch], [best_val_loss], color='green', s=120, zorder=5,
+               marker='*', label=f'Best Val Loss: {best_val_loss:.4f} @ Epoch {best_val_epoch}')
+
+    # 样式设置
+    ax.set_xlabel('Epochs', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Loss', fontsize=13, fontweight='bold')
+    ax.set_title(f'Training and Validation Loss (Total {len(train_losses)} Epochs)',
+                 fontsize=15, fontweight='bold', pad=15)
+    ax.legend(fontsize=11, framealpha=0.9, loc='upper right')
+    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+
+    # 添加数值范围标注
+    ax.text(0.02, 0.98, f'Initial: {val_losses[0]:.3f} → Final: {val_losses[-1]:.3f}',
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    loss_plot_path = f'Result_Fig/loss_plot_epoch_{num_epochs}_{current_time}.png'
+    plt.savefig(loss_plot_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"✓ 损失图已保存: {loss_plot_path}")
+
+    # ==================== NLP指标曲线图 ====================
+    fig, ax = plt.subplots(figsize=(12, 6), dpi=100)
+
+    epochs_metrics = range(1, len(bleu_scores) + 1)
+
+    # 绘制三条曲线
+    ax.plot(epochs_metrics, bleu_scores, 'b-', linewidth=2.5, label='BLEU Score',
+            marker='o', markersize=5, markerfacecolor='white', markeredgewidth=2)
+    ax.plot(epochs_metrics, rouge_l_scores, 'g-', linewidth=2.5, label='ROUGE-L Score',
+            marker='s', markersize=5, markerfacecolor='white', markeredgewidth=2)
+    ax.plot(epochs_metrics, cider_scores, 'r-', linewidth=2.5, label='CIDEr Score',
+            marker='^', markersize=5, markerfacecolor='white', markeredgewidth=2)
+
+    # 标注各指标最佳值
+    best_bleu_epoch = bleu_scores.index(max(bleu_scores)) + 1
+    best_rouge_epoch = rouge_l_scores.index(max(rouge_l_scores)) + 1
+    best_cider_epoch = cider_scores.index(max(cider_scores)) + 1
+
+    ax.scatter([best_bleu_epoch], [max(bleu_scores)], color='blue', s=100, zorder=5, marker='*')
+    ax.scatter([best_rouge_epoch], [max(rouge_l_scores)], color='green', s=100, zorder=5, marker='*')
+    ax.scatter([best_cider_epoch], [max(cider_scores)], color='red', s=100, zorder=5, marker='*')
+
+    # 样式设置
+    ax.set_xlabel('Epochs', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Score', fontsize=13, fontweight='bold')
+    ax.set_title(f'NLP Metric Scores Across Epochs (Total {len(bleu_scores)} Epochs)',
+                 fontsize=15, fontweight='bold', pad=15)
+    ax.legend(fontsize=11, framealpha=0.9, loc='lower right')
+    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+
+    # 添加最佳值标注文本
+    textstr = f'Best BLEU: {max(bleu_scores):.4f} @ Ep{best_bleu_epoch}\n' \
+              f'Best ROUGE-L: {max(rouge_l_scores):.4f} @ Ep{best_rouge_epoch}\n' \
+              f'Best CIDEr: {max(cider_scores):.4f} @ Ep{best_cider_epoch}'
+    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+
+    plt.tight_layout()
+    metrics_plot_path = f'Result_Fig/nlp_metrics_{num_epochs}_{current_time}.png'
+    plt.savefig(metrics_plot_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"✓ 指标图已保存: {metrics_plot_path}")
+
+    # ==================== 打印统计摘要 ====================
+    print(f"\n{'=' * 60}")
+    print("训练统计摘要")
+    print(f"{'=' * 60}")
+    print(f"总轮数: {len(train_losses)}")
+    print(
+        f"训练损失: 初始={train_losses[0]:.4f} → 最终={train_losses[-1]:.4f} (↓{train_losses[0] - train_losses[-1]:.4f})")
+    print(
+        f"验证损失: 初始={val_losses[0]:.4f} → 最终={val_losses[-1]:.4f} (最佳={min(val_losses):.4f} @ Epoch {best_val_epoch})")
+    print(
+        f"BLEU:     初始={bleu_scores[0]:.4f} → 最终={bleu_scores[-1]:.4f} (最佳={max(bleu_scores):.4f} @ Epoch {best_bleu_epoch})")
+    print(
+        f"ROUGE-L:  初始={rouge_l_scores[0]:.4f} → 最终={rouge_l_scores[-1]:.4f} (最佳={max(rouge_l_scores):.4f} @ Epoch {best_rouge_epoch})")
+    print(
+        f"CIDEr:    初始={cider_scores[0]:.4f} → 最终={cider_scores[-1]:.4f} (最佳={max(cider_scores):.4f} @ Epoch {best_cider_epoch})")
+    print(f"{'=' * 60}")
+    print(f"所有图表已保存至 Result_Fig/ 目录")
+
+    # print("开始执行：Phase_4<训练结果可视化>")
+    #
+    # os.makedirs('Result_Fig', exist_ok=True)
+    #
+    # # 绘制损失图
+    # current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # plt.figure(figsize=(10, 5))
+    # # epochs = range(1, num_epochs + 1)
+    # # steps_per_epoch = len(train_loader)
+    # # step_numbers = [i for epoch in epochs for i in range(steps_per_epoch)]  # 生成每个epoch的step编号
+    #
+    # # plt.plot(step_numbers, step_train_losses, label='Training Loss', marker='o')  # 使用每个step的训练loss
+    # # plt.plot(val_losses, label='Validation Loss', marker='o')  # 使用每个epoch的验证loss
+    # # plt.xlabel('Epochs/Steps')
+    # # plt.ylabel('Loss')
+    # # plt.title('Training and Validation Loss')
+    # # plt.xticks(step_numbers[::steps_per_epoch], [f"Epoch {i + 1}" for i in range(num_epochs)])  # 设置横坐标大刻度为epoch
+    # # plt.legend()
+    # # plt.savefig(f'Result_Fig/loss_plot_epoch_{num_epochs}_{current_time}.png')
+    #
+    # plt.plot(train_losses, label='Training Loss')
+    # plt.plot(val_losses, label='Validation Loss')
+    #
+    # plt.xlabel('Epochs')
     # plt.ylabel('Loss')
     # plt.title('Training and Validation Loss')
-    # plt.xticks(step_numbers[::steps_per_epoch], [f"Epoch {i + 1}" for i in range(num_epochs)])  # 设置横坐标大刻度为epoch
     # plt.legend()
+    #
     # plt.savefig(f'Result_Fig/loss_plot_epoch_{num_epochs}_{current_time}.png')
-
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-
-    plt.savefig(f'Result_Fig/loss_plot_epoch_{num_epochs}_{current_time}.png')
-
-    # 绘制NLP指标图
-    plt.figure(figsize=(10, 5))
-    plt.plot(bleu_scores, label='BLEU Score')
-    # plt.plot(meteor_scores, label='METEOR Score')
-    plt.plot(rouge_l_scores, label='ROUGE-L Score')
-    plt.plot(cider_scores, label='CIDEr Score')
-    plt.xlabel('Epochs')
-    plt.ylabel('Score')
-    plt.title('NLP Metric Scores Across Epochs')
-    plt.legend()
-    plt.savefig(f'Result_Fig/nlp_metrics_{num_epochs}_{current_time}.png')
-
-    plt.show()
-
-    print(f"训练评估指标保存至 Result_Fig/ 目录")
+    #
+    # # 绘制NLP指标图
+    # plt.figure(figsize=(10, 5))
+    # plt.plot(bleu_scores, label='BLEU Score')
+    # # plt.plot(meteor_scores, label='METEOR Score')
+    # plt.plot(rouge_l_scores, label='ROUGE-L Score')
+    # plt.plot(cider_scores, label='CIDEr Score')
+    # plt.xlabel('Epochs')
+    # plt.ylabel('Score')
+    # plt.title('NLP Metric Scores Across Epochs')
+    # plt.legend()
+    # plt.savefig(f'Result_Fig/nlp_metrics_{num_epochs}_{current_time}.png')
+    #
+    # plt.show()
+    #
+    # print(f"训练评估指标保存至 Result_Fig/ 目录")
