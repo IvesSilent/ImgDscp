@@ -1,3 +1,4 @@
+# predict.py
 # -*coding=utf-8*-
 import torch.nn.functional as F
 import torch
@@ -121,18 +122,24 @@ if __name__ == "__main__":
     parser.add_argument('--image_path', type=str, default='data/test/test_img/256063.jpg',
                         help='path to the input image')
     parser.add_argument('--model_path', type=str,
-                        default='models/model_epoch_186_2024-11-26_16-52-47.pth',
+                        default='models/0327_Instance01/0327_train_71-80ep/model_epoch_80_2026-03-27_12-18-20.pth',
                         help='path to trained model')
     parser.add_argument('--vocab_path', type=str, default='vocab.pth',
                         help='path to vocabulary object')
     parser.add_argument('--output_dir', type=str, default='singleprd',
                         help='directory to save the output text file')
+    parser.add_argument('--num_captions', type=int, default=5,
+                        help='number of captions to generate')
+    parser.add_argument('--max_len', type=int, default=50,
+                        help='maximum caption length')
 
     args = parser.parse_args()
     model_path = args.model_path
     vocab_path = args.vocab_path
     image_path = args.image_path
     output_dir = args.output_dir
+    num_captions = args.num_captions
+    max_len = args.max_len
 
     print("\t传参完成\n")
 
@@ -141,12 +148,15 @@ if __name__ == "__main__":
     ##############################################################################
     print("开始执行：Phase_1<加载模型和数据>")
 
+    # 加载词汇表
+    vocab = Vocabulary.load(vocab_path)
+
     # 加载模型和词汇表
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ImageCaptioningModel(embed_size=256, hidden_size=512, vocab_size=8943, num_layers=6, dropout=0.3)
+    model = ImageCaptioningModel(embed_size=256, hidden_size=512, vocab_size=len(vocab), num_layers=6, dropout=0.3)
     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
     model.to(device)
-    vocab = torch.load(vocab_path)
+    model.eval()
 
     print("\t模型和词汇表加载完成\n")
 
@@ -161,6 +171,7 @@ if __name__ == "__main__":
     transform = transforms.Compose([
         transforms.Resize((299, 299)),
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
     # 加载图片
@@ -179,8 +190,7 @@ if __name__ == "__main__":
     output_filename = f"{os.path.basename(image_path)}_{current_time}.txt"
     output_filepath = os.path.join(output_dir, output_filename)
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     # with open(output_filepath, 'w') as file:
     #     for j in range(5):  # 生成五句不同的描述
@@ -191,8 +201,26 @@ if __name__ == "__main__":
     #         file.write(f"{image_filename}#{j}\t{caption}\n")
 
     image_filename = os.path.basename(image_path)
+    image_batch = image.unsqueeze(0).to(device)  # (1, 3, 299, 299)
 
-    write_generate_caption(output_filepath, image_filename, image, model, vocab, device, num_caption=5)
+    with torch.no_grad():
+        features = model.encoder(image_batch)
+
+        print(f"对{image_filename}生成的{num_captions}句描述如下：")
+        with open(output_filepath, 'w') as f:
+            for i in range(num_captions):
+                caption = model.decoder.generate(
+                    features,
+                    vocab,
+                    max_len=max_len,
+                    device=device
+                )[0]  # batch_size=1
+
+                line = f"{image_filename}#{i}\t{caption}"
+                f.write(line + "\n")
+                print(f"\t{line}")
+
+    # write_generate_caption(output_filepath, image_filename, image, model, vocab, device, num_caption=5)
 
     print(f"\tCaptions generated and saved to {output_filepath}")
     print(f"\t描述已生成并保存至 {output_filepath}")
