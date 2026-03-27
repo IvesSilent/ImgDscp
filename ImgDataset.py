@@ -1,3 +1,4 @@
+# ImgDataset.py
 # -*coding=utf-8*-
 
 import os
@@ -7,7 +8,7 @@ from PIL import Image
 import pandas as pd
 from torchvision import transforms
 import matplotlib.pyplot as plt
-
+from torch.utils.data import DataLoader
 
 # 【Flickr30kDataset类】
 # 用于加载图像和对应的描述
@@ -22,8 +23,11 @@ class Flickr30kDataset(Dataset):
             vocab (Vocabulary, optional): Preloaded Vocabulary object.
         """
         self.root_dir = root_dir
-        self.df = pd.read_csv(captions_file, delimiter='\t', names=['image', 'caption'])
+
         self.transform = transform
+        self.df = pd.read_csv(captions_file, delimiter='\t', names=['image', 'caption'])
+
+        # 【修改2026/03/25】
 
         # Splitting image names and captions
         self.df['image'] = self.df['image'].apply(lambda x: x.split('#')[0])
@@ -80,22 +84,27 @@ class Flickr30kDataset(Dataset):
 
         if torch.is_tensor(idx):
             idx = idx.tolist()
+
+        # 获取图像和描述
         img_name = self.df.iloc[idx, 0]
         caption = self.df.iloc[idx, 1]
 
         # img_name = self.df.iloc[idx, 'image']
         # caption = self.df.iloc[idx, 'caption']
 
+        # 加载图像
         image = Image.open(img_name).convert("RGB")
-
         if self.transform:
             image = self.transform(image)
 
+        # 数值化caption: [<SOS>, word1, word2, ..., <EOS>]
         numericalized_caption = [self.vocab.stoi["<SOS>"]]
         numericalized_caption += self.vocab.numericalize(caption)
         numericalized_caption.append(self.vocab.stoi["<EOS>"])
 
-        return image, torch.tensor(numericalized_caption)
+        caption_tensor = torch.tensor(numericalized_caption, dtype=torch.long)
+
+        return image, caption_tensor
 
 
 # 【Vocabulary类】
@@ -110,7 +119,13 @@ class Vocabulary:
         return len(self.itos)
 
     def tokenizer_eng(self, text):
-        return [tok.lower() for tok in text.split()]
+        # return [tok.lower() for tok in text.split()]
+
+        # 【修改2026/03/25】
+        # 改进的分词：处理标点符号
+        text = text.lower().strip()
+        # 简单分词，按空格分割（你也可以用nltk.word_tokenize）
+        return text.split()
 
     def build_vocabulary(self, sentence_list):
         frequencies = {}
@@ -130,15 +145,45 @@ class Vocabulary:
 
     def numericalize(self, text):
         tokenized_text = self.tokenizer_eng(text)
-
+        # 【修改2026/03/25】
+        # return [
+        #     self.stoi[token] if token in self.stoi else self.stoi["<UNK>"]
+        #     for token in tokenized_text
+        # ]
         return [
-            self.stoi[token] if token in self.stoi else self.stoi["<UNK>"]
+            self.stoi.get(token, self.stoi["<UNK>"])
             for token in tokenized_text
         ]
 
+    # 【修改2026/03/25】
+    def save(self, path):
+        """保存词汇表"""
+        torch.save({
+            'itos': self.itos,
+            'stoi': self.stoi,
+            'freq_threshold': self.freq_threshold
+        }, path)
+
+    # 【修改2026/03/25】
+    @classmethod
+    def load(cls, path):
+        """加载词汇表"""
+        checkpoint = torch.load(path, weights_only=False) # PyTorch 2.6 的安全机制 需要weights_only=False
+        # 兼容旧格式（直接保存的对象）
+        if isinstance(checkpoint, Vocabulary):
+            return checkpoint
+        # 新格式（字典）
+        vocab = cls(checkpoint['freq_threshold'])
+        vocab.itos = checkpoint['itos']
+        vocab.stoi = checkpoint['stoi']
+        return vocab
 
 # 自定义一个简单的数据集类，仅用于加载测试图片
-class TestDataset(torch.utils.data.Dataset):
+
+
+# 【修改2026/03/25】
+# class TestDataset(torch.utils.data.Dataset):
+class TestDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         """
         Args:
@@ -147,7 +192,15 @@ class TestDataset(torch.utils.data.Dataset):
         """
         self.root_dir = root_dir
         self.transform = transform
-        self.image_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.jpg')]
+
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.gif')
+
+        self.image_files = [
+            os.path.join(root_dir, f)
+            for f in os.listdir(root_dir)
+            if f.endswith(valid_extensions)
+        ]
+        self.image_files.sort()  # 保持顺序一致
 
     def __len__(self):
         return len(self.image_files)
@@ -159,17 +212,38 @@ class TestDataset(torch.utils.data.Dataset):
         if self.transform:
             image = self.transform(image)
 
-        return image, image_path
+        return image, os.path.basename(image_path)
 
+
+# 测试collate函数
+def test_collate(batch):
+    batch.sort(key=lambda x: len(x[1]), reverse=True)
+    images, captions = zip(*batch)
+    images = torch.stack(images, dim=0)
+
+    lengths = [len(cap) for cap in captions]
+    max_len = max(lengths)
+
+    padded_captions = torch.zeros(len(captions), max_len, dtype=torch.long)
+    for i, cap in enumerate(captions):
+        end = lengths[i]
+        padded_captions[i, :end] = cap[:end]
+
+    input_captions = padded_captions[:, :-1]
+    target_captions = padded_captions[:, 1:]
+
+    return images, input_captions, target_captions, lengths
 
 # 示例使用
 if __name__ == "__main__":
+
+    # 测试用transform（与训练时一致）
     transform = transforms.Compose([
         transforms.Resize((299, 299)),  # 调整为Inception模型推荐的最小尺寸
-        transforms.RandomHorizontalFlip(),  # 随机水平翻转
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # 颜色抖动
-        transforms.RandomResizedCrop(size=(299, 299), scale=(0.8, 1.0), ratio=(0.9, 1.1)),  # 随机裁剪和缩放
-        transforms.RandomRotation(degrees=15),  # 随机旋转
+        # transforms.RandomHorizontalFlip(),  # 随机水平翻转
+        # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # 颜色抖动
+        # transforms.RandomResizedCrop(size=(299, 299), scale=(0.8, 1.0), ratio=(0.9, 1.1)),  # 随机裁剪和缩放
+        # transforms.RandomRotation(degrees=15),  # 随机旋转
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -184,24 +258,52 @@ if __name__ == "__main__":
 
     dataset = Flickr30kDataset(root_dir=root_dir,
                                captions_file=captions_file,
-                               transform=transform)
+                               transform=transform,
+                               freq_threshold=5)
     # print(dataset[0][0])  # Print the first (image, caption) pair
 
-    # 选择一个样本
-    image, caption = dataset[0]
+    print(f"Vocab size: {len(dataset.vocab)}")
+    print(f"Dataset size: {len(dataset)}")
 
-    # 显示原始图像
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.title("Original Image")
-    plt.imshow(image.permute(1, 2, 0))  # 直接显示原始PIL图像
-    plt.axis('off')
+    # 测试加载一个样本
+    image, caption_tensor = dataset[0]
+    print(f"Image shape: {image.shape}")  # (3, 299, 299)
+    print(f"Caption tensor: {caption_tensor}")  # 包含<SOS>和<EOS>
+    print(f"Caption length: {len(caption_tensor)}")
 
-    # 应用转换
-    transformed_image, _ = dataset[0]  # 重新从数据集中获取样本，并应用转换
-    plt.subplot(1, 2, 2)
-    plt.title("Transformed Image")
-    plt.imshow(transformed_image.permute(1, 2, 0))  # 将通道维度换到前面，并显示转换后的图像
-    plt.axis('off')
+    # 解码回文本验证
+    words = [dataset.vocab.itos[idx.item()] for idx in caption_tensor]
+    print(f"Decoded: {' '.join(words)}")
 
-    plt.show()
+
+    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=test_collate)
+
+    for imgs, input_caps, target_caps, lengths in loader:
+        print(f"\nBatch image shape: {imgs.shape}")  # (4, 3, 299, 299)
+        print(f"Input captions shape: {input_caps.shape}")  # (4, max_len-1)
+        print(f"Target captions shape: {target_caps.shape}")  # (4, max_len-1)
+        print(f"Lengths: {lengths}")
+
+        # 验证输入-目标对应关系
+        print(f"\nFirst sample input: {[dataset.vocab.itos[idx.item()] for idx in input_caps[0]]}")
+        print(f"First sample target: {[dataset.vocab.itos[idx.item()] for idx in target_caps[0]]}")
+        break
+
+    # # 选择一个样本
+    # image, caption = dataset[0]
+    #
+    # # 显示原始图像
+    # plt.figure(figsize=(10, 5))
+    # plt.subplot(1, 2, 1)
+    # plt.title("Original Image")
+    # plt.imshow(image.permute(1, 2, 0))  # 直接显示原始PIL图像
+    # plt.axis('off')
+    #
+    # # 应用转换
+    # transformed_image, _ = dataset[0]  # 重新从数据集中获取样本，并应用转换
+    # plt.subplot(1, 2, 2)
+    # plt.title("Transformed Image")
+    # plt.imshow(transformed_image.permute(1, 2, 0))  # 将通道维度换到前面，并显示转换后的图像
+    # plt.axis('off')
+    #
+    # plt.show()
