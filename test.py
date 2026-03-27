@@ -1,3 +1,4 @@
+# test.py
 # -*coding=utf-8*-
 
 import torch
@@ -111,6 +112,10 @@ if __name__ == "__main__":
                         help='path to vocabulary object')
     parser.add_argument('--output_file', type=str, default='data/test/test.token',
                         help='output file path to save generated captions')
+    parser.add_argument('--num_captions', type=int, default=5,
+                        help='number of captions to generate per image')
+    parser.add_argument('--max_len', type=int, default=50,
+                        help='maximum caption length')
 
     args = parser.parse_args()
 
@@ -119,6 +124,9 @@ if __name__ == "__main__":
     test_root_dir = args.test_root_dir
     output_file = args.output_file
 
+    num_captions = args.num_captions
+    max_len = args.max_len
+
     print("\t传参完成\n")
 
     # ##############################################################################
@@ -126,12 +134,15 @@ if __name__ == "__main__":
     ################################################################################
     print("开始执行：Phase_1<加载模型和数据>")
 
+    # 加载词汇表
+    vocab = Vocabulary.load(vocab_path)
+
     # 加载模型和词汇表
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ImageCaptioningModel(embed_size=256, hidden_size=512, vocab_size=8943, num_layers=6, dropout=0.3)
+    model = ImageCaptioningModel(embed_size=256, hidden_size=512, vocab_size=len(vocab), num_layers=6, dropout=0.3,max_seq_len=max_len)
     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
     model.to(device)
-    vocab = torch.load(vocab_path)
+    model.eval()
 
     print("\t模型和词汇表加载完成\n")
 
@@ -139,6 +150,7 @@ if __name__ == "__main__":
     transform = transforms.Compose([
         transforms.Resize((299, 299)),
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
     # 加载数据集
@@ -166,12 +178,29 @@ if __name__ == "__main__":
     #
     #             file.write(f"{image_filename}#{j}\t{caption}\n")
 
-    for image, image_path in tqdm(test_loader, desc="Generating captions", total=len(test_loader)):
-        image_filename = os.path.basename(image_path[0])
-        image = image.to(device)  # 确保图像移动到设备
+    # 清空或创建输出文件
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-        # 调用write_generate_caption函数生成描述并保存
-        write_generate_caption(output_file, image_filename, image, model, vocab, device, num_caption=5)
+    with open(output_file, 'w') as f:
+        for image, image_path in tqdm(test_loader, desc="Generating captions", total=len(test_loader)):
+            image_filename = image_path[0]
+            image = image.to(device)
+
+            # 提取图像特征
+            with torch.no_grad():
+                features = model.encoder(image)
+
+            # 生成多条描述（使用简单的temperature采样或top-k）
+            for i in range(num_captions):
+                # 这里使用greedy decoding，如需多样性可实现sampling
+                caption = model.decoder.generate(
+                    features,
+                    vocab,
+                    max_len=max_len,
+                    device=device
+                )[0]  # batch_size=1，取第一个
+
+                f.write(f"{image_filename}#{i}\t{caption}\n")
 
     print(f"Captions generated and saved to {output_file}")
     print(f"描述已生成并保存至 {output_file}")
