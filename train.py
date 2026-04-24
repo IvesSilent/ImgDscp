@@ -372,41 +372,46 @@ if __name__ == "__main__":
     parser.add_argument('--val_captions_file', type=str, default='data/val/val.token',
                         help='Path to the captions file for training')
 
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='batch size')
-    parser.add_argument('--num_epochs', type=int, default=12,
+    parser.add_argument('--num_epochs', type=int, default=60,
                         help='amount of epochs')
-    parser.add_argument('--embed_size', type=int, default=256,
+    parser.add_argument('--embed_size', type=int, default=512,
                         help='size of embedding')
-    parser.add_argument('--hidden_size', type=int, default=512,
+    parser.add_argument('--hidden_size', type=int, default=1024,
                         help='size of hidden')
     parser.add_argument('--vocab_size', type=int, default=7329,
                         help='size of vocabulary')
-    parser.add_argument('--num_layers', type=int, default=2,
+    parser.add_argument('--num_layers', type=int, default=3,
                         help='amount of layers')
     parser.add_argument('--freq_threshold', type=int, default=1,
                         help='threshold frequent')
     parser.add_argument('--early_stop_count', type=int, default=0,
                         help='early stop count')
-    parser.add_argument('--early_stop_limit', type=int, default=5,
+    parser.add_argument('--early_stop_limit', type=int, default=20,
                         help='early stop limit')
 
-    parser.add_argument('--clip_norm', type=float, default=1.0,
+    parser.add_argument('--clip_norm', type=float, default=0.5,
                         help='threshold of grad clip')
-    parser.add_argument('--smooth_epsilon', type=float, default=0.05,
+    parser.add_argument('--smooth_epsilon', type=float, default=0.01,
                         help='label smooth epsilon')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=0.0001,
                         help='learning rate')
-    parser.add_argument('--dropout', type=float, default=0.3,
+    parser.add_argument('--dropout', type=float, default=0.5,
                         help='dropout rate of the model')
     parser.add_argument('--max_seq_len', type=int, default=100,
                         help='The maximum length of a sequence')
+
+    parser.add_argument('--T_max', type=int, default=20,
+                        help='max term of cosine annealing')
+    parser.add_argument('--eta_min', type=float, default=0.00001,
+                        help='threshold of grad clip')
 
     parser.add_argument('--pretrain', action='store_true',
                         help='load trained models')
     parser.add_argument('--unfrozen', action='store_true',
                         help='Unfrozen the model')
-    parser.add_argument('--preModel', type=str, default='models/0327_Instance01/0327_train_81-90ep/model_epoch_90_2026-03-27_13-39-00.pth',
+    parser.add_argument('--preModel', type=str, default='models/0408_instance05/train_ep265-310/model_epoch_310_2026-04-14_07-23-53.pth',
                         help='path to trained models')
     parser.add_argument('--vocab_path', type=str, default='vocab.pth',
                         help='path to local vocab')
@@ -421,6 +426,10 @@ if __name__ == "__main__":
     embed_size = args.embed_size
     hidden_size = args.hidden_size
 
+    # cosine annealing 余弦退火
+    T_max = args.T_max
+    eta_min = args.eta_min
+
     vocab_size = args.vocab_size  # 根据实际情况调整
 
     num_layers = args.num_layers
@@ -434,7 +443,7 @@ if __name__ == "__main__":
     val_captions_file = args.val_captions_file
 
     pretrain = args.pretrain
-    # HARDCODE pretrain=false
+    # HARDCODE pretrain
     # 回头记得改回去
     pretrain = True
 
@@ -454,7 +463,7 @@ if __name__ == "__main__":
     transform_train = transforms.Compose([
         transforms.Resize((299, 299)),  # 调整为Inception模型推荐的最小尺寸
         transforms.RandomHorizontalFlip(),  # 随机水平翻转
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # 颜色抖动
+        # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # 颜色抖动
         transforms.RandomResizedCrop(size=(299, 299), scale=(0.8, 1.0), ratio=(0.9, 1.1)),  # 随机裁剪和缩放
         transforms.RandomRotation(degrees=15),  # 随机旋转
         transforms.ToTensor(),
@@ -482,16 +491,21 @@ if __name__ == "__main__":
     rouge_l_scores = []
     cider_scores = []
 
-    print(f"\n\t训练参数列表:\n"
-          f"\tnum_layers = {num_layers}\n"
-          f"\tembed_size = {embed_size}\n"
-          f"\thidden_size = {hidden_size}\n"
-          f"\tdropout = {dropout}\n"
-          f"\tlearning_rate = {learning_rate}\n"
-          f"\tbatch_size = {batch_size}\n"
-          f"\tnum_epochs = {num_epochs}\n"
-          f"\tsmooth_epsilon = {smooth_epsilon}\n"
-          f"\tpretrain = {pretrain}\n")
+    print(f"\n### 训练参数列表 ###\n---\n"
+          f" - num_layers = {num_layers}\n"
+          f" - embed_size = {embed_size}\n"
+          f" - hidden_size = {hidden_size}\n"
+          f" - dropout = {dropout}\n"
+          f" - clip_norm = {clip_norm}\n"
+          f" - learning_rate = {learning_rate}\n"
+          f" - batch_size = {batch_size}\n"
+          f" - num_epochs = {num_epochs}\n"
+          f" - smooth_epsilon = {smooth_epsilon}\n"
+          f" - T_max = {T_max}\n"
+          f" - eta_min = {eta_min}\n"
+          f" - pretrain = {pretrain}\n")
+
+
 
     print("\t传参完成\n")
 
@@ -508,7 +522,7 @@ if __name__ == "__main__":
     train_dataset = Flickr30kDataset(
         root_dir=train_root_dir,
         captions_file=train_captions_file,
-        transform=transform_val,
+        transform=transform_train,
         freq_threshold=freq_threshold,
         vocab=vocab
     )
@@ -559,11 +573,12 @@ if __name__ == "__main__":
     # 【优化项】修改优化器为Adam优化器，采用权重衰减
     # optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     # optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 
     # 【优化项】在 train.py 中添加学习率调度器
     # https://zhuanlan.zhihu.com/p/538447997
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=0.0001)  # 余弦退火
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6 )  # 余弦退火
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min )  # 余弦退火
     # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)  # 指数下降
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.1)
 
@@ -852,17 +867,17 @@ if __name__ == "__main__":
     print(f"\n{'=' * 60}")
     print("训练统计摘要")
     print(f"{'=' * 60}")
-    print(f"总轮数: {len(train_losses)}")
+    print(f" - 总轮数: {len(train_losses)}")
     print(
-        f"训练损失: 初始={train_losses[0]:.4f} → 最终={train_losses[-1]:.4f} (↓{train_losses[0] - train_losses[-1]:.4f})")
+        f" - 训练损失: 初始={train_losses[0]:.4f} → 最终={train_losses[-1]:.4f} (↓{train_losses[0] - train_losses[-1]:.4f})")
     print(
-        f"验证损失: 初始={val_losses[0]:.4f} → 最终={val_losses[-1]:.4f} (最佳={min(val_losses):.4f} @ Epoch {best_val_epoch})")
+        f" - 验证损失: 初始={val_losses[0]:.4f} → 最终={val_losses[-1]:.4f} (最佳={min(val_losses):.4f} @ Epoch {best_val_epoch})")
     print(
-        f"BLEU:     初始={bleu_scores[0]:.4f} → 最终={bleu_scores[-1]:.4f} (最佳={max(bleu_scores):.4f} @ Epoch {best_bleu_epoch})")
+        f" - BLEU:     初始={bleu_scores[0]:.4f} → 最终={bleu_scores[-1]:.4f} (最佳={max(bleu_scores):.4f} @ Epoch {best_bleu_epoch})")
     print(
-        f"ROUGE-L:  初始={rouge_l_scores[0]:.4f} → 最终={rouge_l_scores[-1]:.4f} (最佳={max(rouge_l_scores):.4f} @ Epoch {best_rouge_epoch})")
+        f" - ROUGE-L:  初始={rouge_l_scores[0]:.4f} → 最终={rouge_l_scores[-1]:.4f} (最佳={max(rouge_l_scores):.4f} @ Epoch {best_rouge_epoch})")
     print(
-        f"CIDEr:    初始={cider_scores[0]:.4f} → 最终={cider_scores[-1]:.4f} (最佳={max(cider_scores):.4f} @ Epoch {best_cider_epoch})")
+        f" - CIDEr:    初始={cider_scores[0]:.4f} → 最终={cider_scores[-1]:.4f} (最佳={max(cider_scores):.4f} @ Epoch {best_cider_epoch})")
     print(f"{'=' * 60}")
     print(f"所有图表已保存至 Result_Fig/ 目录")
 

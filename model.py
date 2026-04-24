@@ -31,9 +31,15 @@ class EncoderCNN(nn.Module):
         for param in self.features.parameters():
             param.requires_grad = False
 
+        # 【关键修改】全局自适应池化 + 投影到embed_size
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # (batch, 2048, 8, 8) -> (batch, 2048, 1, 1)
+
         # 将CNN特征维度映射到embed_size
         self.feature_proj = nn.Sequential(
-            nn.Linear(feature_dim, embed_size),
+            nn.Linear(feature_dim, embed_size* 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(embed_size * 2, embed_size),
             nn.ReLU(),
             nn.Dropout(p=dropout)
         )
@@ -51,23 +57,27 @@ class EncoderCNN(nn.Module):
             features: (batch_size, num_patches, embed_size) 序列化特征
         """
         # 提取特征: (batch, 2048, 8, 8)
-        cnn_features = self.features(images)
+        cnn_features = self.features(images)# (B, 2048, 8, 8)
 
         batch_size = cnn_features.size(0)
+        # 添加全局聚合token（类似CLS token），但不替换空间特征
+        global_token = self.global_pool(cnn_features).squeeze(-1).squeeze(-1)  # (B, 2048)
+        global_token = self.feature_proj(global_token).unsqueeze(1)  # (B, 1, 512)
+
 
         # 展平空间维度: (batch, 2048, 8, 8) -> (batch, 2048, 64) -> (batch, 64, 2048)
         cnn_features = cnn_features.flatten(2).transpose(1, 2)  # (batch, 64, 2048)
 
         # 投影到embed_size: (batch, 64, embed_size)
-        features = self.feature_proj(cnn_features)
+        # 加位置编码（只对局部特征）
+        spatial_features = self.feature_proj(cnn_features) + self.pos_embed
 
         # 加位置编码
-        features = features + self.pos_embed
+        # features = features + self.pos_embed
 
-        return features
-
-
-
+        # 拼接：65个token = 1全局 + 64局部
+        features = torch.cat([global_token, spatial_features], dim=1)
+        return features  # (B, 65, 512)
 
 # 【Transformer解码器】
 class DecoderTransformer(nn.Module):
