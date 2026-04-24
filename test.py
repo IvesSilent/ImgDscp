@@ -9,7 +9,7 @@ from model import ImageCaptioningModel
 from ImgDataset import TestDataset, Vocabulary
 import argparse
 from tqdm import tqdm
-
+import random
 
 # 标注生成函
 def generate_caption(image, model, vocab, device):
@@ -95,6 +95,93 @@ def write_generate_caption(output_filepath, image_filename, image, model, vocab,
                 file.write(f"{image_filename}#{i}\t{result_caption}\n")
                 # print(f"{image_filename}#{i}\t{result_caption}")
 
+############################
+# 【修改0327】生成5句多样化的描述
+############################
+def generate_diverse_captions(image, model, vocab, device, num_captions=5, max_len=50, strategy='top5'):
+    """
+    生成多样化的描述
+
+    Args:
+        image: 输入图像 (1, 3, 299, 299) 或 (3, 299, 299)
+        model: 模型
+        vocab: 词汇表
+        device: 设备
+        num_captions: 生成描述数量
+        max_len: 最大长度
+        strategy: 'top5' - 取前5名; 'random_top5' - 从前5随机采样
+    """
+    model.eval()
+    with torch.no_grad():
+        # 确保图像维度正确
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
+        image = image.to(device)
+
+        # 提取图像特征 (1, num_patches, embed_size)
+        features = model.encoder(image)
+
+        results = []
+
+        # 第一步：获取第一个词的候选
+        captions = torch.tensor([[vocab.stoi['<SOS>']]], dtype=torch.long, device=device)
+        output = model.decoder(features, captions)  # (1, 1, vocab_size)
+
+        # 获取第一个位置的预测概率
+        logits = output[0, 0, :]  # (vocab_size,)
+        probs = torch.softmax(logits, dim=-1)
+
+        # 选择策略
+        if strategy == 'top5':
+            # 取概率最高的5个，排除<SOS>和<PAD>
+            top_probs, top_indices = torch.topk(probs, k=num_captions + 10)  # 多取一些以防特殊token
+
+            first_tokens = []
+            for idx in top_indices:
+                token = idx.item()
+                word = vocab.itos[token]
+                # 排除特殊token和空字符串
+                if word not in ['<SOS>', '<EOS>', '<PAD>', '<UNK>', '']:
+                    first_tokens.append(token)
+                if len(first_tokens) >= num_captions:
+                    break
+
+        elif strategy == 'random_top5':
+            # 从前10名中随机选5个（允许重复以增加随机性）
+            top_probs, top_indices = torch.topk(probs, k=10)
+            # 过滤特殊token
+            valid_indices = [idx.item() for idx in top_indices
+                             if vocab.itos[idx.item()] not in ['<SOS>', '<EOS>', '<PAD>', '<UNK>', '']]
+
+            if len(valid_indices) < num_captions:
+                # 如果有效token不够，补充随机选择
+                valid_indices.extend([random.choice(valid_indices) for _ in range(num_captions - len(valid_indices))])
+
+            first_tokens = [random.choice(valid_indices) for _ in range(num_captions)]
+
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        # 为每个first_token生成完整序列
+        for i, first_token in enumerate(first_tokens):
+            captions = torch.tensor([[vocab.stoi['<SOS>'], first_token]], dtype=torch.long, device=device)
+            result_caption = [vocab.itos[first_token]]
+
+            for _ in range(max_len - 1):  # 已经生成了第一个词
+                output = model.decoder(features, captions)
+                predicted = output.argmax(-1)[:, -1]  # 贪婪解码
+                predicted_word = vocab.itos[predicted.item()]
+
+                if predicted_word == '<EOS>':
+                    break
+
+                result_caption.append(predicted_word)
+                captions = torch.cat((captions, predicted.unsqueeze(0)), dim=1)
+
+            results.append(' '.join(result_caption))
+
+    return results
+
 
 if __name__ == "__main__":
     # ##############################################################################
@@ -116,6 +203,9 @@ if __name__ == "__main__":
                         help='number of captions to generate per image')
     parser.add_argument('--max_len', type=int, default=50,
                         help='maximum caption length')
+    parser.add_argument('--strategy', type=str, default='top5', # 【修改0327】生成策略可选
+                        choices=['top5', 'random_top5'],
+                        help='diversity strategy: top5 or random_top5')
 
     args = parser.parse_args()
 
@@ -123,9 +213,9 @@ if __name__ == "__main__":
     vocab_path = args.vocab_path
     test_root_dir = args.test_root_dir
     output_file = args.output_file
-
     num_captions = args.num_captions
     max_len = args.max_len
+    strategy = args.strategy
 
     print("\t传参完成\n")
 
@@ -184,22 +274,35 @@ if __name__ == "__main__":
     with open(output_file, 'w') as f:
         for image, image_path in tqdm(test_loader, desc="Generating captions", total=len(test_loader)):
             image_filename = image_path[0]
-            image = image.to(device)
 
-            # 提取图像特征
-            with torch.no_grad():
-                features = model.encoder(image)
 
-            # 生成多条描述（使用简单的temperature采样或top-k）
-            for i in range(num_captions):
-                # 这里使用greedy decoding，如需多样性可实现sampling
-                caption = model.decoder.generate(
-                    features,
-                    vocab,
-                    max_len=max_len,
-                    device=device
-                )[0]  # batch_size=1，取第一个
+            # image = image.to(device)
+            #
+            # # 提取图像特征
+            # with torch.no_grad():
+            #     features = model.encoder(image)
+            #
+            # # 生成多条描述（使用简单的temperature采样或top-k）
+            # for i in range(num_captions):
+            #     # 这里使用greedy decoding，如需多样性可实现sampling
+            #     caption = model.decoder.generate(
+            #         features,
+            #         vocab,
+            #         max_len=max_len,
+            #         device=device
+            #     )[0]  # batch_size=1，取第一个
+            #
+            #     f.write(f"{image_filename}#{i}\t{caption}\n")
 
+            # 使用新的多样性生成函数
+            captions = generate_diverse_captions(
+                image, model, vocab, device,
+                num_captions=num_captions,
+                max_len=max_len,
+                strategy=strategy
+            )
+
+            for i, caption in enumerate(captions):
                 f.write(f"{image_filename}#{i}\t{caption}\n")
 
     print(f"Captions generated and saved to {output_file}")

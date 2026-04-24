@@ -7,31 +7,31 @@
 ```
 image-captioning-project/
 │
-├── data/                       # 数据集目录
-│   ├── train/                  # 训练集目录
-│   │   ├── train_img/          # 训练集图片
-│   │   └── train.token        # 训练集标注
-│   ├── val/                   # 验证集目录
-│   │   ├── val_img/           # 验证集图片
-│   │   └── val.token          # 验证集标注
-│   └── test/                  # 测试集目录
-│       ├── test_img/          # 测试集图片
-│       └── test.token         # 测试集输出
+├── data/ # 数据集目录
+│ ├── train/ # 训练集目录
+│ │ ├── train_img/ # 训练集图片
+│ │ └── train.token # 训练集标注
+│ ├── val/ # 验证集目录
+│ │ ├── val_img/ # 验证集图片
+│ │ └── val.token # 验证集标注
+│ └── test/ # 测试集目录
+│ ├── test_img/ # 测试集图片
+│ └── test.token # 测试集输出
 │
-├── /Result_Fig/                  # 训练过程可视化的图片文档
-├── /models/                      # 训练后模型保存目录
-├── /models/                      # 训练日志保存目录
-├── /singleprd/                   # 存放predict.py生成的描述文本
+├── /Result_Fig/ # 训练过程可视化的图片文档
+├── /models/ # 训练后模型保存目录
+├── /models/ # 训练日志保存目录
+├── /singleprd/ # 存放predict.py生成的描述文本
 │
-├── model.py                  # 模型架构定义文件
-├── ImgDataset.py              # 数据集处理类定义文件
-├── train.py                  # 训练及验证过程脚本
-├── test.py                   # 测试过程脚本
-├── predict.py                 # 单独预测过程脚本
-├── prepare_flickr30k.py        # [2026更新]Flickr30k数据集处理文件
-├── vocab.pth                     # 词表文件
-├── requirements.txt           # 项目依赖环境文件
-└── README.md                 # 项目说明文档
+├── model.py # 模型架构定义文件
+├── ImgDataset.py # 数据集处理类定义文件
+├── train.py # 训练及验证过程脚本
+├── test.py # 测试过程脚本
+├── predict.py # 单独预测过程脚本
+├── prepare_flickr30k.py # [2026更新]Flickr30k数据集处理文件
+├── vocab.pth # 词表文件
+├── requirements.txt # 项目依赖环境文件
+└── README.md # 项目说明文档
 ```
 
 ## 环境配置
@@ -118,59 +118,59 @@ pip install -r requirements.txt
 
 我选用了InceptionV3作为CNN编码器，以及包含自注意力机制的Transformer作为解码器。模型架构定义在 `model.py` 文件中。
 
-| 技术/优化手段 | 描述                                          | 参数细节                     |
+| 技术/优化手段 | 描述 | 参数细节 |
 |---------|---------------------------------------------|--------------------------|
-| 框架      | PyTorch                                     | 版本1.9.0                  |
-| 编码器     | CNN，使用轻量化的预训练架构Inception V3                 | 权重：ImageNet1K v1         |
-| 解码器     | Transformer，包括多个解码器层，每层包括自注意力机制、前馈神经网络和层归一化 | 层数：6，头数：8，隐藏层维度：512      |
-| 特征适配层   | 提取多层特征并合并以一个注意力层合并为特征序列                     | 适配层数：11，使用ReLU激活和Dropout |
-| 硬件加速    | 若设备可用GPU则使用GPU进行训练、验证和预测                    |                          |
-| 正则化     | 加入可调的Dropout方法以防止过拟合                        | Dropout率：0.3             |
+| 框架 | PyTorch | 版本1.9.0 |
+| 编码器 | CNN，使用轻量化的预训练架构Inception V3 | 权重：ImageNet1K v1 |
+| 解码器 | Transformer，包括多个解码器层，每层包括自注意力机制、前馈神经网络和层归一化 | 层数：6，头数：8，隐藏层维度：512 |
+| 特征适配层 | 提取多层特征并合并以一个注意力层合并为特征序列 | 适配层数：11，使用ReLU激活和Dropout |
+| 硬件加速 | 若设备可用GPU则使用GPU进行训练、验证和预测 | |
+| 正则化 | 加入可调的Dropout方法以防止过拟合 | Dropout率：0.3 |
 
 ## 训练及验证
 
 训练和验证过程由 `train.py` 脚本控制。我使用Xavier均匀初始化权重，采用交叉熵损失和Adam优化器进行优化，并使用余弦退火学习率调度机制。训练过程中还会计算BLEU、ROUGE、CIDEr等指标。
 
-| 技术/优化手段 | 描述                                    | 参数细节                    |
+| 技术/优化手段 | 描述 | 参数细节 |
 |---------|---------------------------------------|-------------------------|
-| 权重初始化   | 使用Xavier均匀初始化权重                       |                         |
-| 损失函数    | 使用交叉熵损失来优化模型，引入标签平滑技术                 | 平滑参数ε：0.05              |
-| 优化器     | 使用Adam优化器                             | 学习率：0.0005，权重衰减：1e-5    |
-| 学习率调度   | 余弦退火的学习率调度机制                          | T_max：20，η_min：0.000001 |
-| 混合精度计算  | 使用混合精度计算的方式训练                         |                         |
-| 学习方式    | 使用Teacher Forcing的学习方式                |                         |
-| 进度显示    | 以进度条显示训练的进度                           |                         |
-| 模型存储    | 训练完成后存储模型方便调整学习率多次训练，模型存储于/models目录   |                         |
-| 早停机制    | 加入早停机制来避免过拟合，并在验证集上性能不再提升时停止训练        | 早停阈值：5个epoch无提升         |
-| 性能评估    | 训练同时进行验证，计算BLEU、ROUGE、CIDEr等指标并可视化    |                         |
-| 可视化存储   | 将可视化的图片存入/Result_Fig，将训练后的模型存入/models |                         |
-| 进度显示    | 以进度条显示验证的进度                           |                         |
+| 权重初始化 | 使用Xavier均匀初始化权重 | |
+| 损失函数 | 使用交叉熵损失来优化模型，引入标签平滑技术 | 平滑参数ε：0.05 |
+| 优化器 | 使用Adam优化器 | 学习率：0.0005，权重衰减：1e-5 |
+| 学习率调度 | 余弦退火的学习率调度机制 | T_max：20，η_min：0.000001 |
+| 混合精度计算 | 使用混合精度计算的方式训练 | |
+| 学习方式 | 使用Teacher Forcing的学习方式 | |
+| 进度显示 | 以进度条显示训练的进度 | |
+| 模型存储 | 训练完成后存储模型方便调整学习率多次训练，模型存储于/models目录 | |
+| 早停机制 | 加入早停机制来避免过拟合，并在验证集上性能不再提升时停止训练 | 早停阈值：5个epoch无提升 |
+| 性能评估 | 训练同时进行验证，计算BLEU、ROUGE、CIDEr等指标并可视化 | |
+| 可视化存储 | 将可视化的图片存入/Result_Fig，将训练后的模型存入/models | |
+| 进度显示 | 以进度条显示验证的进度 | |
 
 在终端启动train.py，配置对应的参数，或直接采用默认参数。
 
 ```bash
 python train.py \
-  --train_root_dir data/train/train_img \
-  --train_captions_file data/train/train.token \
-  --val_root_dir data/val/val_img \
-  --val_captions_file data/val/val.token \
-  --batch_size 32 \
-  --num_epochs 40 \
-  --embed_size 256 \
-  --hidden_size 512 \
-  --vocab_size 7329 \
-  --num_layers 2 \
-  --freq_threshold 1 \
-  --early_stop_count 0 \
-  --early_stop_limit 5 \
-  --clip_norm 1.0 \
-  --smooth_epsilon 0.1 \
-  --lr 0.001 \
-  --dropout 0.3 \
-  --pretrain  \
-  --preModel  models/YOUR_OLD_MODEL.pth\
-  --vocab_path vocab.pth
-  ```
+ --train_root_dir data/train/train_img \
+ --train_captions_file data/train/train.token \
+ --val_root_dir data/val/val_img \
+ --val_captions_file data/val/val.token \
+ --batch_size 32 \
+ --num_epochs 40 \
+ --embed_size 256 \
+ --hidden_size 512 \
+ --vocab_size 7329 \
+ --num_layers 2 \
+ --freq_threshold 1 \
+ --early_stop_count 0 \
+ --early_stop_limit 5 \
+ --clip_norm 1.0 \
+ --smooth_epsilon 0.1 \
+ --lr 0.001 \
+ --dropout 0.3 \
+ --pretrain \
+ --preModel models/YOUR_OLD_MODEL.pth\
+ --vocab_path vocab.pth
+ ```
 
 ## 测试
 
@@ -194,4 +194,3 @@ python train.py \
 ## 许可证
 
 本项目采用 [MIT License](https://opensource.org/licenses/MIT)。
-
